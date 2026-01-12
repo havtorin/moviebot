@@ -82,14 +82,26 @@ def get_conn():
 def get_user_id(chat_id: int) -> int:
     conn = get_conn()
     c = conn.cursor()
+
+    # сначала пробуем найти пользователя
     c.execute("SELECT id FROM users WHERE chat_id = ?", (chat_id,))
     row = c.fetchone()
     if row:
         user_id = row[0]
-    else:
+        conn.close()
+        return user_id
+
+    # если не нашли — пробуем вставить
+    try:
         c.execute("INSERT INTO users (chat_id) VALUES (?)", (chat_id,))
         conn.commit()
         user_id = c.lastrowid
+    except sqlite3.IntegrityError:
+        # если за это время запись уже появилась (гонка) — просто читаем её
+        c.execute("SELECT id FROM users WHERE chat_id = ?", (chat_id,))
+        row = c.fetchone()
+        user_id = row[0]
+
     conn.close()
     return user_id
 
