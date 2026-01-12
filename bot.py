@@ -25,8 +25,7 @@ if not BOT_TOKEN or not TMDB_API_KEY:
 
 bot = telebot.TeleBot(BOT_TOKEN, parse_mode="HTML")
 
-DB_PATH = "cinemate_v3.db"   # при смене имени получишь чистую БД
-
+DB_PATH = "cinemate_5v.db"
 
 # Жанры TMDb (id -> название по-русски)
 TMDB_GENRES = {
@@ -102,7 +101,7 @@ def init_db():
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             user_id INTEGER,
             tmdb_id INTEGER,
-            status TEXT,      -- watched / unseen / favorite / watchlist
+            status TEXT,      -- watched / unseen / favorite / rec_*
             weight INTEGER,
             created_at DATETIME DEFAULT CURRENT_TIMESTAMP
         )
@@ -120,6 +119,7 @@ def init_db():
         )
     """)
 
+    # на случай старой БД без столбца shown — пробуем добавить
     try:
         c.execute("ALTER TABLE calibration_items ADD COLUMN shown INTEGER DEFAULT 0")
     except sqlite3.OperationalError:
@@ -143,6 +143,18 @@ def init_db():
             tmdb_id INTEGER,
             title TEXT,
             media_type TEXT,
+            added_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+            UNIQUE(user_id, tmdb_id)
+        )
+    """)
+
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS rec_shown (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER,
+            tmdb_id INTEGER,
+            times_shown INTEGER DEFAULT 0,
+            last_shown_at DATETIME DEFAULT CURRENT_TIMESTAMP,
             UNIQUE(user_id, tmdb_id)
         )
     """)
@@ -258,10 +270,12 @@ def toggle_user_genre(user_id: int, genre_id: int):
 
 def add_feedback(user_id: int, tmdb_id: int, status: str):
     weight_map = {
-        "unseen": 0,
         "watched": 1,
-        "watchlist": 3,
+        "unseen": 0,
         "favorite": 5,
+        "rec_watched": 1,
+        "rec_watchlist": 4,
+        "rec_skip": -3,
     }
     weight = weight_map.get(status, 0)
     conn = get_conn()
@@ -295,8 +309,6 @@ def get_feedback_statuses(user_id: int) -> Dict[int, str]:
 def add_calibration_items(user_id: int, items: List[Dict[str, Any]]):
     conn = get_conn()
     c = conn.cursor()
-    # очищаем старую калибровку, чтобы не копилось
-    c.execute("DELETE FROM calibration_items WHERE user_id=?", (user_id,))
     for it in items:
         tmdb_id = it["id"]
         media_type = it.get("media_type") or ("tv" if it.get("name") else "movie")
@@ -310,6 +322,7 @@ def add_calibration_items(user_id: int, items: List[Dict[str, Any]]):
 
 
 def get_next_calibration_batch(user_id: int, limit: int = 3) -> List[Tuple[int, int, str, str]]:
+    """Берём только те, что ещё НЕ показывали (shown=0)."""
     conn = get_conn()
     c = conn.cursor()
     c.execute("""
@@ -319,6 +332,7 @@ def get_next_calibration_batch(user_id: int, limit: int = 3) -> List[Tuple[int, 
         LIMIT ?
     """, (user_id, limit))
     rows = c.fetchall()
+    # помечаем их как показанные
     if rows:
         ids = [str(r[0]) for r in rows]
         q = f"UPDATE calibration_items SET shown=1 WHERE id IN ({','.join(ids)})"
@@ -385,14 +399,33 @@ def add_to_watchlist(user_id: int, tmdb_id: int, title: str, media_type: str):
 def get_watchlist(user_id: int) -> List[Tuple[int, str, str]]:
     conn = get_conn()
     c = conn.cursor()
-    c.execute("""
-        SELECT tmdb_id, title, media_type
-        FROM watchlist
-        WHERE user_id=?
-    """, (user_id,))
+    c.execute("SELECT tmdb_id, title, media_type FROM watchlist WHERE user_id=?", (user_id,))
     rows = c.fetchall()
     conn.close()
     return rows
+
+
+def get_rec_shown(user_id: int) -> Dict[int, int]:
+    conn = get_conn()
+    c = conn.cursor()
+    c.execute("SELECT tmdb_id, times_shown FROM rec_shown WHERE user_id=?", (user_id,))
+    rows = c.fetchall()
+    conn.close()
+    return {r[0]: r[1] for r in rows}
+
+
+def mark_rec_shown(user_id: int, tmdb_id: int):
+    conn = get_conn()
+    c = conn.cursor()
+    c.execute("""
+        INSERT INTO rec_shown (user_id, tmdb_id, times_shown)
+        VALUES (?, ?, 1)
+        ON CONFLICT(user_id, tmdb_id) DO UPDATE SET
+            times_shown = times_shown + 1,
+            last_shown_at = CURRENT_TIMESTAMP
+    """, (user_id, tmdb_id))
+    conn.commit()
+    conn.close()
 
 
 # =========================
@@ -429,27 +462,6 @@ def get_tmdb_details(media_type: str, tmdb_id: int) -> Optional[Dict[str, Any]]:
     return tmdb_get(f"/{media_type}/{tmdb_id}", {})
 
 
-def get_imdb_url(media_type: str, tmdb_id: int) -> Optional[str]:
-    """
-    Пытаемся достать imdb_id.
-    Для фильмов он лежит прямо в /movie/{id}.
-    Для сериалов — через /tv/{id}/external_ids.
-    """
-    imdb_id = None
-    if media_type == "movie":
-        details = get_tmdb_details("movie", tmdb_id)
-        if details:
-            imdb_id = details.get("imdb_id")
-    elif media_type == "tv":
-        data = tmdb_get(f"/tv/{tmdb_id}/external_ids", {})
-        if data:
-            imdb_id = data.get("imdb_id")
-
-    if imdb_id:
-        return f"https://www.imdb.com/title/{imdb_id}/"
-    return None
-
-
 def get_similar_and_recommended(media_type: str, tmdb_id: int) -> List[Dict[str, Any]]:
     res: List[Dict[str, Any]] = []
     for kind in ("similar", "recommendations"):
@@ -457,6 +469,19 @@ def get_similar_and_recommended(media_type: str, tmdb_id: int) -> List[Dict[str,
         if data and data.get("results"):
             res.extend(data["results"])
     return res
+
+
+def get_imdb_url(media_type: str, tmdb_id: int) -> Optional[str]:
+    """Возвращаем ссылку на IMDb, если есть external_id."""
+    if media_type not in ("movie", "tv"):
+        return None
+    data = tmdb_get(f"/{media_type}/{tmdb_id}/external_ids", {})
+    if not data:
+        return None
+    imdb_id = data.get("imdb_id")
+    if not imdb_id:
+        return None
+    return f"https://www.imdb.com/title/{imdb_id}/"
 
 
 # =========================
@@ -491,32 +516,22 @@ def start_genre_selection(chat_id: int, user_id: int):
 #  Калибровка похожего (look-alike)
 # =========================
 
-def build_calibration_candidates(user_id: int, max_per_fav: int = 10, max_total: int = 9):
-    """
-    Собираем кандидатов для look-alike.
-    Жёстко ограничиваем общим максимумом max_total (например, 9 тайтлов).
-    """
+def build_calibration_candidates(user_id: int, max_per_fav: int = 10):
     favorites = get_favorites(user_id)
     candidates: Dict[int, Dict[str, Any]] = {}
-
     for tmdb_id, title, media_type in favorites:
         items = get_similar_and_recommended(media_type, tmdb_id) or []
         for it in items[:max_per_fav]:
             cid = it["id"]
             if cid not in candidates:
                 candidates[cid] = it
-                if len(candidates) >= max_total:
-                    break
-        if len(candidates) >= max_total:
-            break
-
     add_calibration_items(user_id, list(candidates.values()))
 
 
 def send_calibration_batch(chat_id: int, user_id: int):
     """
     Показываем максимум 3 тайтла, которые ещё не показывали (shown=0).
-    Всего по пользователю не больше 9 (задаётся в build_calibration_candidates).
+    Новую тройку шлём только когда текущие все оценены.
     """
     batch = get_next_calibration_batch(user_id, limit=3)
     if not batch:
@@ -529,28 +544,6 @@ def send_calibration_batch(chat_id: int, user_id: int):
         return
 
     for row_id, tmdb_id, title, media_type in batch:
-        details = get_tmdb_details(media_type, tmdb_id) or {}
-        if media_type == "movie":
-            title_ru = details.get("title") or title
-            orig_title = details.get("original_title")
-            date = details.get("release_date")
-        else:
-            title_ru = details.get("name") or title
-            orig_title = details.get("original_name")
-            date = details.get("first_air_date")
-
-        year = date[:4] if date else "—"
-        kind = "Фильм" if media_type == "movie" else "Сериал"
-        imdb_url = get_imdb_url(media_type, tmdb_id)
-
-        lines = [f"<b>{title_ru}</b> ({year})", f"<i>{kind}</i>"]
-        if orig_title and orig_title != title_ru:
-            lines.append(f"Ориг. название: {orig_title}")
-        if imdb_url:
-            lines.append(f"IMDb: {imdb_url}")
-        lines.append("")
-        lines.append("Отметь свою реакцию:")
-
         kb = types.InlineKeyboardMarkup()
         kb.row(
             types.InlineKeyboardButton("Смотрел", callback_data=f"calib:{row_id}:watched"),
@@ -560,7 +553,33 @@ def send_calibration_batch(chat_id: int, user_id: int):
             types.InlineKeyboardButton("❤️ Попал в сердечко", callback_data=f"calib:{row_id}:favorite")
         )
 
-        bot.send_message(chat_id, "\n".join(lines), reply_markup=kb)
+        kind = "Фильм" if media_type == "movie" else "Сериал"
+
+        # год и IMDb
+        details = get_tmdb_details(media_type, tmdb_id) or {}
+        if media_type == "movie":
+            date_str = details.get("release_date")
+        else:
+            date_str = details.get("first_air_date")
+        year = date_str.split("-")[0] if date_str else None
+        imdb_url = get_imdb_url(media_type, tmdb_id)
+
+        text_lines = []
+        if year:
+            text_lines.append(f"<b>{title}</b> ({year})")
+        else:
+            text_lines.append(f"<b>{title}</b>")
+        text_lines.append(f"<i>{kind}</i>")
+        if imdb_url:
+            text_lines.append(f"IMDb: {imdb_url}")
+        text_lines.append("")
+        text_lines.append("Отметь свою реакцию:")
+
+        bot.send_message(
+            chat_id,
+            "\n".join(text_lines),
+            reply_markup=kb
+        )
 
 
 # =========================
@@ -575,10 +594,12 @@ def build_recommendations(user_id: int, limit: int = 10) -> List[Dict[str, Any]]
     user_genres = set(get_user_genres(user_id))
     feedback_weights = get_feedback_weights(user_id)
     feedback_statuses = get_feedback_statuses(user_id)
-    watch = get_watchlist(user_id)
-    watch_ids = {w[0] for w in watch}
+    shown_counts = get_rec_shown(user_id)
 
     candidate_scores: Dict[int, Dict[str, Any]] = {}
+
+    MIN_VOTE_COUNT = 50
+    POPULARITY_NORM = 10.0
 
     for tmdb_id, title, media_type in favorites:
         items = get_similar_and_recommended(media_type, tmdb_id) or []
@@ -586,15 +607,11 @@ def build_recommendations(user_id: int, limit: int = 10) -> List[Dict[str, Any]]
         for it in items:
             cid = it["id"]
 
-            # не предлагаем:
-            # - то, что уже в избранном
-            # - то, что уже в watchlist
-            # - то, что пользователь отметил как watched/favorite
+            fb_status = feedback_statuses.get(cid)
+            if fb_status in ("rec_watched", "rec_skip"):
+                continue
+
             if any(cid == f[0] for f in favorites):
-                continue
-            if cid in watch_ids:
-                continue
-            if cid in feedback_statuses and feedback_statuses[cid] in ("watched", "favorite"):
                 continue
 
             cmedia = it.get("media_type") or ("tv" if it.get("name") else "movie")
@@ -602,6 +619,7 @@ def build_recommendations(user_id: int, limit: int = 10) -> List[Dict[str, Any]]
             genres = it.get("genre_ids") or []
             rating = it.get("vote_average") or 0.0
             popularity = it.get("popularity") or 0.0
+            vote_count = it.get("vote_count") or 0
 
             data = candidate_scores.setdefault(
                 cid,
@@ -612,10 +630,15 @@ def build_recommendations(user_id: int, limit: int = 10) -> List[Dict[str, Any]]
                     "genres": genres,
                     "rating": rating,
                     "popularity": popularity,
+                    "vote_count": vote_count,
                     "freq": 0,
                     "score": 0.0,
                 }
             )
+
+            data["rating"] = max(data["rating"], rating)
+            data["popularity"] = max(data["popularity"], popularity)
+            data["vote_count"] = max(data["vote_count"], vote_count)
             data["freq"] += 1
 
     for cid, data in candidate_scores.items():
@@ -623,68 +646,99 @@ def build_recommendations(user_id: int, limit: int = 10) -> List[Dict[str, Any]]
         genre_overlap = len(genres & user_genres)
         rating = data["rating"]
         popularity = data["popularity"]
+        vote_count = data["vote_count"]
         freq = data["freq"]
         feedback_bonus = feedback_weights.get(cid, 0)
+        times_shown = shown_counts.get(cid, 0)
+
+        low_vote_penalty = 2.0 if vote_count < MIN_VOTE_COUNT else 0.0
 
         score = (
             2.3 * freq +
             1.2 * genre_overlap +
             1.0 * rating +
-            0.6 * (popularity / 10) +
-            2.5 * feedback_bonus
+            0.6 * (popularity / POPULARITY_NORM) +
+            2.5 * feedback_bonus -
+            0.7 * times_shown -
+            low_vote_penalty
         )
 
         score += random.uniform(-0.3, 0.3)
+
         data["score"] = score
 
     ranked = sorted(candidate_scores.values(), key=lambda x: x["score"], reverse=True)
     return ranked[:limit]
 
 
-def send_recommendation_card(chat_id: int, user_id: int, item: Dict[str, Any]):
-    tmdb_id = item["tmdb_id"]
-    media_type = item["media_type"]
-    rating = item["rating"]
-    genres_ids = item["genres"]
-    genres = [TMDB_GENRES.get(gid, "") for gid in genres_ids]
-    genres_str = ", ".join([g for g in genres if g])
-
-    details = get_tmdb_details(media_type, tmdb_id) or {}
-    if media_type == "movie":
-        title_ru = details.get("title") or item["title"]
-        orig_title = details.get("original_title")
-        date = details.get("release_date")
-    else:
-        title_ru = details.get("name") or item["title"]
-        orig_title = details.get("original_name")
-        date = details.get("first_air_date")
-
-    year = date[:4] if date else "—"
-    kind = "Фильм" if media_type == "movie" else "Сериал"
-    imdb_url = get_imdb_url(media_type, tmdb_id)
-
-    lines = [f"<b>{title_ru}</b> ({year})", f"<i>{kind}</i>"]
-    if orig_title and orig_title != title_ru:
-        lines.append(f"Ориг. название: {orig_title}")
-    if genres_str:
-        lines.append(f"Жанры: {genres_str}")
-    if rating:
-        lines.append(f"Рейтинг TMDb: {rating:.1f}")
-    if imdb_url:
-        lines.append(f"IMDb: {imdb_url}")
-
-    kb = types.InlineKeyboardMarkup()
-    kb.row(
-        types.InlineKeyboardButton("👁 Уже смотрел", callback_data=f"rec:{tmdb_id}:{media_type}:seen"),
-        types.InlineKeyboardButton("⭐ Watchlist", callback_data=f"rec:{tmdb_id}:{media_type}:wl"),
-    )
-    if media_type == "tv":
-        kb.row(
-            types.InlineKeyboardButton("🔔 Следить за сериалом",
-                                       callback_data=f"rec:{tmdb_id}:{media_type}:sub")
+def send_recommendations(chat_id: int, user_id: int, limit: int = 10):
+    recs = build_recommendations(user_id, limit=limit)
+    if not recs:
+        bot.send_message(
+            chat_id,
+            "Пока мало данных для рекомендаций.\n"
+            "Запусти /start и добавь любимые тайтлы, а затем пройди калибровку."
         )
+        return
 
-    bot.send_message(chat_id, "\n".join(lines), reply_markup=kb)
+    bot.send_message(chat_id, "<b>Вот что может зайти:</b>")
+
+    for item in recs:
+        tmdb_id = item["tmdb_id"]
+        title = item["title"]
+        media_type = item["media_type"]
+        rating = item["rating"]
+        genres = [TMDB_GENRES.get(gid, "") for gid in item["genres"]]
+        genres_str = ", ".join([g for g in genres if g])
+
+        details = get_tmdb_details(media_type, tmdb_id) or {}
+        if media_type == "movie":
+            date_str = details.get("release_date")
+        else:
+            date_str = details.get("first_air_date")
+        year = date_str.split("-")[0] if date_str else None
+
+        kind = "Фильм" if media_type == "movie" else "Сериал"
+
+        text_lines = []
+        if year:
+            text_lines.append(f"<b>{title}</b> ({year})")
+        else:
+            text_lines.append(f"<b>{title}</b>")
+        text_lines.append(f"<i>{kind}</i>")
+        if genres_str:
+            text_lines.append(f"Жанры: {genres_str}")
+        if rating:
+            text_lines.append(f"Рейтинг TMDb: {rating:.1f}")
+
+        text = "\n".join(text_lines)
+
+        kb = types.InlineKeyboardMarkup()
+        kb.row(
+            types.InlineKeyboardButton(
+                "👁 Уже смотрел", callback_data=f"rec:{tmdb_id}:{media_type}:seen"
+            ),
+            types.InlineKeyboardButton(
+                "➕ В watchlist", callback_data=f"rec:{tmdb_id}:{media_type}:watch"
+            ),
+        )
+        if media_type == "tv":
+            kb.row(
+                types.InlineKeyboardButton(
+                    "📺 Следить за сериалом", callback_data=f"rec:{tmdb_id}:{media_type}:follow"
+                )
+            )
+
+        bot.send_message(chat_id, text, reply_markup=kb)
+        mark_rec_shown(user_id, tmdb_id)
+
+    more_kb = types.InlineKeyboardMarkup()
+    more_kb.add(
+        types.InlineKeyboardButton(
+            "🔁 Хочу новые реко", callback_data="more_recs"
+        )
+    )
+    bot.send_message(chat_id, "Хочешь новые реко? Жми 👇", reply_markup=more_kb)
 
 
 # =========================
@@ -751,7 +805,6 @@ def handle_start(message: types.Message):
             "• /recommend — подобрать, что посмотреть\n"
             "• /mylikes — показать твой список любимых\n"
             "• /mysubs — сериалы, за которыми я слежу\n"
-            "• /watchlist — «буду смотреть»\n"
             "• /help — подсказка по функциям"
         )
 
@@ -764,16 +817,11 @@ def handle_help(message: types.Message):
         "Как со мной работать:\n"
         "1. Добавь любимые тайтлы через /start (онбординг).\n"
         "2. Отметь жанры, которые нравятся.\n"
-        "3. Пройди look-alike калибровку (Смотрел / Не смотрел / ❤️).\n"
-        "4. Используй /recommend — получай карточки с рекомендациями.\n"
-        "   У каждой карточки можно:\n"
-        "   • отметить «Уже смотрел» (убирает из будущих реко)\n"
-        "   • добавить в ⭐ Watchlist\n"
-        "   • включить 🔔 слежение за сериалом.\n\n"
+        "3. Оцени похожие фильмы/сериалы (Смотрел / Не смотрел / ❤️).\n"
+        "4. Используй /recommend, чтобы получить подборку.\n\n"
         "Сервисные команды:\n"
         "• /mylikes — твой список любимых\n"
         "• /mysubs — сериалы под слежением\n"
-        "• /watchlist — что ты отложил «буду смотреть»\n"
         "• /recommend — свежие рекомендации"
     )
 
@@ -828,48 +876,11 @@ def handle_mysubs(message: types.Message):
     bot.send_message(chat_id, "\n".join(text_lines), reply_markup=kb)
 
 
-@bot.message_handler(commands=['watchlist'])
-def handle_watchlist(message: types.Message):
-    chat_id = message.chat.id
-    user_id = get_user_id(chat_id)
-    wl = get_watchlist(user_id)
-    if not wl:
-        bot.send_message(chat_id, "Твой watchlist пока пуст. Добавляй фильмы и сериалы из /recommend.")
-        return
-
-    movies = [w for w in wl if w[2] == "movie"]
-    tvs = [w for w in wl if w[2] == "tv"]
-
-    lines = []
-    if movies:
-        lines.append("<b>Фильмы (буду смотреть):</b>")
-        for tmdb_id, title, _ in movies:
-            lines.append(f"• {title}")
-        lines.append("")
-    if tvs:
-        lines.append("<b>Сериалы (буду смотреть):</b>")
-        for tmdb_id, title, _ in tvs:
-            lines.append(f"• {title}")
-
-    bot.send_message(chat_id, "\n".join(lines))
-
-
 @bot.message_handler(commands=['recommend'])
 def handle_recommend(message: types.Message):
     chat_id = message.chat.id
     user_id = get_user_id(chat_id)
-    recs = build_recommendations(user_id, limit=10)
-    if not recs:
-        bot.send_message(
-            chat_id,
-            "Пока мало данных для рекомендаций.\n"
-            "Запусти /start, добавь любимые тайтлы и пройди калибровку."
-        )
-        return
-
-    bot.send_message(chat_id, "<b>Вот что может зайти:</b>")
-    for item in recs:
-        send_recommendation_card(chat_id, user_id, item)
+    send_recommendations(chat_id, user_id)
 
 
 # =========================
@@ -890,7 +901,7 @@ def handle_text(message: types.Message):
         bot.send_message(
             chat_id,
             "Я тебя услышал, но пока лучше пользоваться командами:\n"
-            "/recommend, /mylikes, /mysubs, /watchlist, /help"
+            "/recommend, /mylikes, /mysubs, /help"
         )
 
 
@@ -955,7 +966,7 @@ def handle_await_subscribe_title(message: types.Message, user_id: int):
 
 
 # =========================
-#  Callback'и (жанры, калибровка, реко, /mysubs)
+#  Callback'и (жанры, калибровка, /mysubs, реко)
 # =========================
 
 @bot.callback_query_handler(func=lambda call: True)
@@ -1016,6 +1027,42 @@ def handle_callback(call: types.CallbackQuery):
         if remaining == 0 and get_state(user_id) == "calibration":
             send_calibration_batch(chat_id, user_id)
 
+    elif data.startswith("rec:"):
+        # rec:<tmdb_id>:<media_type>:<action>
+        _, tmdb_id_str, media_type, action = data.split(":", 3)
+        tmdb_id = int(tmdb_id_str)
+
+        details = get_tmdb_details(media_type, tmdb_id) or {}
+        title = (
+            details.get("title")
+            or details.get("name")
+            or details.get("original_title")
+            or details.get("original_name")
+            or "Без названия"
+        )
+
+        if action == "watch":
+            add_to_watchlist(user_id, tmdb_id, title, media_type)
+            add_feedback(user_id, tmdb_id, "rec_watchlist")
+            bot.answer_callback_query(call.id, "Добавил в watchlist 👍")
+
+        elif action == "seen":
+            add_feedback(user_id, tmdb_id, "rec_watched")
+            bot.answer_callback_query(call.id, "Учёл, что ты уже смотрел 👌")
+
+        elif action == "follow" and media_type == "tv":
+            last_air_date = details.get("last_air_date")
+            add_subscription_for_tv(user_id, tmdb_id, title, last_air_date)
+            add_feedback(user_id, tmdb_id, "rec_watchlist")
+            bot.answer_callback_query(call.id, "Буду следить за новым сезоном 📺")
+
+        else:
+            bot.answer_callback_query(call.id)
+
+    elif data == "more_recs":
+        bot.answer_callback_query(call.id)
+        send_recommendations(chat_id, user_id)
+
     elif data == "subs_add":
         bot.answer_callback_query(call.id)
         set_state(user_id, "await_subscribe_title")
@@ -1023,35 +1070,6 @@ def handle_callback(call: types.CallbackQuery):
             chat_id,
             "Напиши название сериала, за которым хочешь, чтобы я следил."
         )
-
-    elif data.startswith("rec:"):
-        # rec:<tmdb_id>:<media_type>:<action>
-        try:
-            _, tmdb_id_str, media_type, action = data.split(":", 3)
-            tmdb_id = int(tmdb_id_str)
-        except ValueError:
-            bot.answer_callback_query(call.id)
-            return
-
-        details = get_tmdb_details(media_type, tmdb_id) or {}
-        if media_type == "movie":
-            title_ru = details.get("title") or details.get("original_title") or "Без названия"
-        else:
-            title_ru = details.get("name") or details.get("original_name") or "Без названия"
-
-        if action == "seen":
-            add_feedback(user_id, tmdb_id, "watched")
-            bot.answer_callback_query(call.id, "Отметил как «уже смотрел»")
-        elif action == "wl":
-            add_to_watchlist(user_id, tmdb_id, title_ru, media_type)
-            add_feedback(user_id, tmdb_id, "watchlist")
-            bot.answer_callback_query(call.id, "Добавил в watchlist")
-        elif action == "sub" and media_type == "tv":
-            last_air_date = details.get("last_air_date")
-            add_subscription_for_tv(user_id, tmdb_id, title_ru, last_air_date)
-            bot.answer_callback_query(call.id, "Теперь слежу за сериалом")
-        else:
-            bot.answer_callback_query(call.id)
 
     else:
         bot.answer_callback_query(call.id)
