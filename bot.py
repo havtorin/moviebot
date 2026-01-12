@@ -2,15 +2,15 @@ import os
 import time
 import threading
 import sqlite3
+import random
 from typing import Optional, List, Dict, Any, Tuple
 
 import requests
 import telebot
 from telebot import types
 
-from dotenv import load_dotenv   # ← ДОБАВИТЬ ЭТО
-from recommender import generate_recommendations   # ← ДОБАВЬ ЭТУ СТРОКУ
-load_dotenv()                    # ← И ЭТО (до os.getenv)
+from dotenv import load_dotenv
+load_dotenv()
 
 # =========================
 #  Настройки
@@ -293,7 +293,6 @@ def get_next_calibration_batch(user_id: int, limit: int = 3) -> List[Tuple[int, 
         LIMIT ?
     """, (user_id, limit))
     rows = c.fetchall()
-    # помечаем их как показанные
     if rows:
         ids = [str(r[0]) for r in rows]
         q = f"UPDATE calibration_items SET shown=1 WHERE id IN ({','.join(ids)})"
@@ -464,7 +463,6 @@ def send_calibration_batch(chat_id: int, user_id: int):
             "Отметь свою реакцию:",
             reply_markup=kb
         )
-    # маленький прогресс можно делать по кол-ву оставшихся, если хочется
 
 
 # =========================
@@ -522,7 +520,6 @@ def build_recommendations(user_id: int, limit: int = 10) -> List[Dict[str, Any]]
         freq = data["freq"]
         feedback_bonus = feedback_weights.get(cid, 0)
 
-        # Улучшенная скоринговая формула
         score = (
             2.3 * freq +
             1.2 * genre_overlap +
@@ -562,7 +559,6 @@ def subscription_worker():
                     continue
                 new_last_air_date = details.get("last_air_date")
                 if new_last_air_date and new_last_air_date != last_air_date:
-                    # обновился last_air_date -> notify
                     update_subscription_last_air_date(user_id, tmdb_id, new_last_air_date)
                     chat_id = get_chat_id(user_id)
                     if chat_id:
@@ -574,7 +570,7 @@ def subscription_worker():
         except Exception as e:
             print(f"subscription_worker error: {e}")
 
-        time.sleep(3600)  # раз в час; можно увеличить
+        time.sleep(3600)
 
 
 # =========================
@@ -723,7 +719,6 @@ def handle_text(message: types.Message):
     elif state == "await_subscribe_title":
         handle_await_subscribe_title(message, user_id)
     else:
-        # фоллбек — подсказываем команды
         bot.send_message(
             chat_id,
             "Я тебя услышал, но пока лучше пользоваться командами:\n"
@@ -739,7 +734,6 @@ def handle_await_favorites(message: types.Message, user_id: int):
         bot.send_message(chat_id, "Не увидел названий. Напиши через запятую 3–10 фильмов/сериалов.")
         return
 
-    added = 0
     for t in titles:
         result = search_tmdb_multi(t)
         if not result:
@@ -749,7 +743,6 @@ def handle_await_favorites(message: types.Message, user_id: int):
         media_type = result.get("media_type") or ("tv" if result.get("name") else "movie")
         title = result.get("title") or result.get("name") or t
         add_favorite(user_id, tmdb_id, title, media_type)
-        added += 1
         bot.send_message(chat_id, f"Добавил в любимые: <b>{title}</b> ({'сериал' if media_type=='tv' else 'фильм'})")
 
     total = count_favorites(user_id)
@@ -760,7 +753,6 @@ def handle_await_favorites(message: types.Message, user_id: int):
         )
         return
 
-    # Переходим к выбору жанров
     bot.send_message(
         chat_id,
         f"Отлично, у тебя уже {total} любимых тайтлов.\n"
@@ -804,16 +796,17 @@ def handle_callback(call: types.CallbackQuery):
     user_id = get_user_id(chat_id)
     data = call.data or ""
 
+    # Жанры
     if data.startswith("genre:"):
         _, gid_str = data.split(":", 1)
         gid = int(gid_str)
         toggle_user_genre(user_id, gid)
-        # перерисовать клаву
         kb = build_genre_keyboard(user_id)
         bot.edit_message_reply_markup(chat_id, call.message.message_id, reply_markup=kb)
         bot.answer_callback_query(call.id)
+        return
 
-    elif data == "genre_done":
+    if data == "genre_done":
         bot.answer_callback_query(call.id)
         set_state(user_id, "calibration")
         bot.send_message(
@@ -823,14 +816,14 @@ def handle_callback(call: types.CallbackQuery):
         )
         build_calibration_candidates(user_id)
         send_calibration_batch(chat_id, user_id)
+        return
 
-       elif data.startswith("calib:"):
-        # calib:<row_id>:<status>
+    # Калибровка
+    if data.startswith("calib:"):
         _, row_id_str, status = data.split(":", 2)
         row_id = int(row_id_str)
         set_calibration_status(row_id, status)
 
-        # достанем инфо о тайтле, чтобы корректно обработать favorite
         conn = get_conn()
         c = conn.cursor()
         c.execute("SELECT tmdb_id, title, media_type FROM calibration_items WHERE id=?", (row_id,))
@@ -841,13 +834,11 @@ def handle_callback(call: types.CallbackQuery):
             add_feedback(user_id, tmdb_id, status)
             if status == "favorite":
                 add_favorite(user_id, tmdb_id, title, media_type)
-                # если сериал — сразу включаем слежение
                 if media_type == "tv":
                     details = get_tmdb_details("tv", tmdb_id) or {}
                     last_air_date = details.get("last_air_date")
                     add_subscription_for_tv(user_id, tmdb_id, title, last_air_date)
 
-        # считаем, остались ли среди уже показанных (shown=1) неоценённые
         c.execute("""
             SELECT COUNT(*) FROM calibration_items
             WHERE user_id=? AND shown=1 AND status IS NULL
@@ -857,20 +848,21 @@ def handle_callback(call: types.CallbackQuery):
 
         bot.answer_callback_query(call.id, "Сохранил 👍")
 
-        # если всё, что показали, уже оценено — шлём следующую тройку
         if remaining == 0 and get_state(user_id) == "calibration":
             send_calibration_batch(chat_id, user_id)
+        return
 
-    elif data == "subs_add":
+    # Добавление сериала в подписки
+    if data == "subs_add":
         bot.answer_callback_query(call.id)
         set_state(user_id, "await_subscribe_title")
         bot.send_message(
             chat_id,
             "Напиши название сериала, за которым хочешь, чтобы я следил."
         )
+        return
 
-    else:
-        bot.answer_callback_query(call.id)
+    bot.answer_callback_query(call.id)
 
 
 # =========================
@@ -879,7 +871,6 @@ def handle_callback(call: types.CallbackQuery):
 
 if __name__ == "__main__":
     init_db()
-    # фоновый поток проверки подписок
     threading.Thread(target=subscription_worker, daemon=True).start()
     print("Bot is running...")
     bot.infinity_polling(skip_pending=True, timeout=20, long_polling_timeout=20)
