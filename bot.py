@@ -25,7 +25,7 @@ if not BOT_TOKEN or not TMDB_API_KEY:
 
 bot = telebot.TeleBot(BOT_TOKEN, parse_mode="HTML")
 
-DB_PATH = "cinemate.db"
+DB_PATH = "cinemate_v2.db"
 
 # Жанры TMDb (id -> название по-русски)
 TMDB_GENRES = {
