@@ -9,7 +9,7 @@ import telebot
 from telebot import types
 
 from dotenv import load_dotenv   # ← ДОБАВИТЬ ЭТО
-
+from recommender import generate_recommendations   # ← ДОБАВЬ ЭТУ СТРОКУ
 load_dotenv()                    # ← И ЭТО (до os.getenv)
 
 # =========================
@@ -113,10 +113,17 @@ def init_db():
             user_id INTEGER,
             tmdb_id INTEGER,
             title TEXT,
-            media_type TEXT,  -- movie / tv
-            status TEXT       -- NULL / watched / unseen / favorite
+            media_type TEXT,
+            status TEXT,
+            shown INTEGER DEFAULT 0
         )
     """)
+
+    # на случай старой БД без столбца shown — пробуем добавить
+    try:
+        c.execute("ALTER TABLE calibration_items ADD COLUMN shown INTEGER DEFAULT 0")
+    except sqlite3.OperationalError:
+        pass
 
     c.execute("""
         CREATE TABLE IF NOT EXISTS subscriptions (
@@ -268,23 +275,30 @@ def add_calibration_items(user_id: int, items: List[Dict[str, Any]]):
         media_type = it.get("media_type") or ("tv" if it.get("name") else "movie")
         title = it.get("title") or it.get("name") or "Без названия"
         c.execute("""
-            INSERT OR IGNORE INTO calibration_items (user_id, tmdb_id, title, media_type, status)
-            VALUES (?, ?, ?, ?, NULL)
+            INSERT OR IGNORE INTO calibration_items (user_id, tmdb_id, title, media_type, status, shown)
+            VALUES (?, ?, ?, ?, NULL, 0)
         """, (user_id, tmdb_id, title, media_type))
     conn.commit()
     conn.close()
 
 
 def get_next_calibration_batch(user_id: int, limit: int = 3) -> List[Tuple[int, int, str, str]]:
+    """Берём только те, что ещё НЕ показывали (shown=0)."""
     conn = get_conn()
     c = conn.cursor()
     c.execute("""
         SELECT id, tmdb_id, title, media_type
         FROM calibration_items
-        WHERE user_id=? AND (status IS NULL)
+        WHERE user_id=? AND shown=0
         LIMIT ?
     """, (user_id, limit))
     rows = c.fetchall()
+    # помечаем их как показанные
+    if rows:
+        ids = [str(r[0]) for r in rows]
+        q = f"UPDATE calibration_items SET shown=1 WHERE id IN ({','.join(ids)})"
+        c.execute(q)
+        conn.commit()
     conn.close()
     return rows
 
@@ -420,6 +434,10 @@ def build_calibration_candidates(user_id: int, max_per_fav: int = 10):
 
 
 def send_calibration_batch(chat_id: int, user_id: int):
+    """
+    Показываем максимум 3 тайтла, которые ещё не показывали (shown=0).
+    Новую тройку шлём только когда текущие все оценены.
+    """
     batch = get_next_calibration_batch(user_id, limit=3)
     if not batch:
         set_state(user_id, None)
@@ -431,7 +449,6 @@ def send_calibration_batch(chat_id: int, user_id: int):
         return
 
     for row_id, tmdb_id, title, media_type in batch:
-        # Кнопки реакций: Смотрел / Не смотрел / ❤️
         kb = types.InlineKeyboardMarkup()
         kb.row(
             types.InlineKeyboardButton("Смотрел", callback_data=f"calib:{row_id}:watched"),
@@ -464,17 +481,22 @@ def build_recommendations(user_id: int, limit: int = 10) -> List[Dict[str, Any]]
 
     candidate_scores: Dict[int, Dict[str, Any]] = {}
 
+    # собираем кандидатов
     for tmdb_id, title, media_type in favorites:
         items = get_similar_and_recommended(media_type, tmdb_id) or []
+
         for it in items:
             cid = it["id"]
+
+            # не рекомендовать то, что уже в избранном
             if any(cid == f[0] for f in favorites):
-                continue  # не предлагаем уже любимое
+                continue
 
             cmedia = it.get("media_type") or ("tv" if it.get("name") else "movie")
             ctitle = it.get("title") or it.get("name") or "Без названия"
             genres = it.get("genre_ids") or []
             rating = it.get("vote_average") or 0.0
+            popularity = it.get("popularity") or 0.0
 
             data = candidate_scores.setdefault(
                 cid,
@@ -484,26 +506,34 @@ def build_recommendations(user_id: int, limit: int = 10) -> List[Dict[str, Any]]
                     "media_type": cmedia,
                     "genres": genres,
                     "rating": rating,
+                    "popularity": popularity,
                     "freq": 0,
                     "score": 0.0,
                 }
             )
             data["freq"] += 1
 
+    # скоринг
     for cid, data in candidate_scores.items():
         genres = set(data["genres"])
         genre_overlap = len(genres & user_genres)
         rating = data["rating"]
+        popularity = data["popularity"]
         freq = data["freq"]
         feedback_bonus = feedback_weights.get(cid, 0)
 
-        # простая скоринговая формула
+        # Улучшенная скоринговая формула
         score = (
-            2.0 * freq +
+            2.3 * freq +
+            1.2 * genre_overlap +
             1.0 * rating +
-            1.0 * genre_overlap +
-            1.5 * feedback_bonus
+            0.6 * (popularity / 10) +
+            2.5 * feedback_bonus
         )
+
+        # случайный шум для разнообразия
+        score += random.uniform(-0.3, 0.3)
+
         data["score"] = score
 
     ranked = sorted(candidate_scores.values(), key=lambda x: x["score"], reverse=True)
@@ -794,7 +824,7 @@ def handle_callback(call: types.CallbackQuery):
         build_calibration_candidates(user_id)
         send_calibration_batch(chat_id, user_id)
 
-    elif data.startswith("calib:"):
+       elif data.startswith("calib:"):
         # calib:<row_id>:<status>
         _, row_id_str, status = data.split(":", 2)
         row_id = int(row_id_str)
@@ -805,7 +835,7 @@ def handle_callback(call: types.CallbackQuery):
         c = conn.cursor()
         c.execute("SELECT tmdb_id, title, media_type FROM calibration_items WHERE id=?", (row_id,))
         row = c.fetchone()
-        conn.close()
+
         if row:
             tmdb_id, title, media_type = row
             add_feedback(user_id, tmdb_id, status)
@@ -817,9 +847,18 @@ def handle_callback(call: types.CallbackQuery):
                     last_air_date = details.get("last_air_date")
                     add_subscription_for_tv(user_id, tmdb_id, title, last_air_date)
 
+        # считаем, остались ли среди уже показанных (shown=1) неоценённые
+        c.execute("""
+            SELECT COUNT(*) FROM calibration_items
+            WHERE user_id=? AND shown=1 AND status IS NULL
+        """, (user_id,))
+        remaining = c.fetchone()[0]
+        conn.close()
+
         bot.answer_callback_query(call.id, "Сохранил 👍")
-        # отправляем следующую пачку, если пользователь всё ещё в калибровке
-        if get_state(user_id) == "calibration":
+
+        # если всё, что показали, уже оценено — шлём следующую тройку
+        if remaining == 0 and get_state(user_id) == "calibration":
             send_calibration_batch(chat_id, user_id)
 
     elif data == "subs_add":
