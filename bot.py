@@ -25,7 +25,7 @@ if not BOT_TOKEN or not TMDB_API_KEY:
     raise RuntimeError("BOT_TOKEN и TMDB_API_KEY должны быть заданы в переменных окружения")
 
 bot = telebot.TeleBot(BOT_TOKEN, parse_mode="HTML")
-DB_PATH = "cinemate_v11.db"
+DB_PATH = "cinemate_v12.db"
 
 # Жанры TMDb (id -> название по-русски)
 TMDB_GENRES = {
@@ -469,6 +469,7 @@ def send_calibration_batch(chat_id: int, user_id: int):
     """
     Показываем максимум 3 тайтла, которые ещё не показывали (shown=0).
     Новую тройку шлём только когда текущие все оценены.
+    С постером + год + жанры + рейтинг + ссылка на IMDb.
     """
     batch = get_next_calibration_batch(user_id, limit=3)
     if not batch:
@@ -481,6 +482,49 @@ def send_calibration_batch(chat_id: int, user_id: int):
         return
 
     for row_id, tmdb_id, title, media_type in batch:
+        # Подтягиваем детали, чтобы отрисовать карточку
+        details = get_tmdb_details(media_type, tmdb_id) or {}
+        poster_path = details.get("poster_path")
+        vote = details.get("vote_average") or 0.0
+        release_date = details.get("first_air_date") or details.get("release_date") or ""
+        year = release_date[:4] if release_date else "—"
+
+        genre_ids = details.get("genres") or []  # TMDb может вернуть [{id, name}, ...]
+        if genre_ids and isinstance(genre_ids[0], dict):
+            gids = [g["id"] for g in genre_ids]
+        else:
+            gids = genre_ids or []
+
+        genres = [TMDB_GENRES.get(gid, "") for gid in gids]
+        genres_str = ", ".join([g for g in genres if g])
+
+        # IMDb-ссылка (как в старом билде)
+        imdb_id = None
+        try:
+            external = tmdb_get(f"/{media_type}/{tmdb_id}/external_ids", {})
+            if external:
+                imdb_id = external.get("imdb_id")
+        except Exception:
+            imdb_id = None
+
+        imdb_link = f"https://www.imdb.com/title/{imdb_id}" if imdb_id else None
+
+        kind = "Сериал" if media_type == "tv" else "Фильм"
+
+        caption_lines = [
+            f"<b>{title}</b>",
+            f"<i>{kind}, {year}</i>",
+        ]
+        if genres_str:
+            caption_lines.append(f"Жанры: {genres_str}")
+        if vote:
+            caption_lines.append(f"Рейтинг TMDb: {vote:.1f}")
+        if imdb_link:
+            caption_lines.append(f'<a href="{imdb_link}">Ссылка на IMDb</a>')
+
+        caption = "\n".join(caption_lines)
+
+        # Клавиатура как раньше: смотрел / не смотрел / сердечко
         kb = types.InlineKeyboardMarkup()
         kb.row(
             types.InlineKeyboardButton("Смотрел", callback_data=f"calib:{row_id}:watched"),
@@ -489,13 +533,12 @@ def send_calibration_batch(chat_id: int, user_id: int):
         kb.row(
             types.InlineKeyboardButton("❤️ Попал в сердечко", callback_data=f"calib:{row_id}:favorite")
         )
-        kind = "Фильм" if media_type == "movie" else "Сериал"
-        bot.send_message(
-            chat_id,
-            f"<b>{title}</b>\n<i>{kind}</i>\n\n"
-            "Отметь свою реакцию:",
-            reply_markup=kb
-        )
+
+        if poster_path:
+            poster_url = f"https://image.tmdb.org/t/p/w500{poster_path}"
+            bot.send_photo(chat_id, poster_url, caption=caption, reply_markup=kb)
+        else:
+            bot.send_message(chat_id, caption, reply_markup=kb)
 
 
 # =========================
