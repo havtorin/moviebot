@@ -25,7 +25,7 @@ if not BOT_TOKEN or not TMDB_API_KEY:
     raise RuntimeError("BOT_TOKEN и TMDB_API_KEY должны быть заданы в переменных окружения")
 
 bot = telebot.TeleBot(BOT_TOKEN, parse_mode="HTML")
-DB_PATH = "cinemate_v12.db"
+DB_PATH = "cinemate_v13.db"
 
 # Жанры TMDb (id -> название по-русски)
 TMDB_GENRES = {
@@ -102,7 +102,7 @@ def init_db():
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             user_id INTEGER,
             tmdb_id INTEGER,
-            status TEXT,      -- watched / unseen / favorite / liked / disliked / blocked
+            status TEXT,      -- watched / unseen / favorite / liked / disliked / blocked / shown
             weight INTEGER,
             created_at DATETIME DEFAULT CURRENT_TIMESTAMP
         )
@@ -135,6 +135,18 @@ def init_db():
             media_type TEXT,  -- 'tv'
             last_air_date TEXT,
             last_notified_at TEXT
+        )
+    """)
+
+    # отдельный watchlist "буду смотреть"
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS watchlist (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER,
+            tmdb_id INTEGER,
+            title TEXT,
+            media_type TEXT,
+            UNIQUE(user_id, tmdb_id)
         )
     """)
 
@@ -253,12 +265,13 @@ def toggle_user_genre(user_id: int, genre_id: int):
 
 def add_feedback(user_id: int, tmdb_id: int, status: str):
     weight_map = {
-        "watched": 1,
+        "watched": 1,      # калибровка: "смотрел"
         "unseen": 0,
         "favorite": 5,
         "liked": 3,
         "disliked": -2,
-        "blocked": -100,
+        "blocked": -100,   # жёстко исключаем из реко
+        "shown": -1,       # показали в реко, но пользователь мог проигнорировать
     }
     weight = weight_map.get(status, 0)
     conn = get_conn()
@@ -366,6 +379,28 @@ def update_subscription_last_air_date(user_id: int, tmdb_id: int, last_air_date:
     """, (last_air_date, last_air_date, user_id, tmdb_id))
     conn.commit()
     conn.close()
+
+
+# --- watchlist helpers ---
+
+def add_to_watchlist(user_id: int, tmdb_id: int, title: str, media_type: str):
+    conn = get_conn()
+    c = conn.cursor()
+    c.execute("""
+        INSERT OR IGNORE INTO watchlist (user_id, tmdb_id, title, media_type)
+        VALUES (?, ?, ?, ?)
+    """, (user_id, tmdb_id, title, media_type))
+    conn.commit()
+    conn.close()
+
+
+def get_watchlist(user_id: int) -> List[Tuple[int, str, str]]:
+    conn = get_conn()
+    c = conn.cursor()
+    c.execute("SELECT tmdb_id, title, media_type FROM watchlist WHERE user_id=?", (user_id,))
+    rows = c.fetchall()
+    conn.close()
+    return rows
 
 
 # =========================
@@ -482,32 +517,18 @@ def send_calibration_batch(chat_id: int, user_id: int):
         return
 
     for row_id, tmdb_id, title, media_type in batch:
-        # Подтягиваем детали, чтобы отрисовать карточку
         details = get_tmdb_details(media_type, tmdb_id) or {}
         poster_path = details.get("poster_path")
         vote = details.get("vote_average") or 0.0
         release_date = details.get("first_air_date") or details.get("release_date") or ""
         year = release_date[:4] if release_date else "—"
 
-        genre_ids = details.get("genres") or []  # TMDb может вернуть [{id, name}, ...]
-        if genre_ids and isinstance(genre_ids[0], dict):
-            gids = [g["id"] for g in genre_ids]
-        else:
-            gids = genre_ids or []
-
+        genre_objs = details.get("genres") or []
+        gids = [g.get("id") for g in genre_objs] if genre_objs else []
         genres = [TMDB_GENRES.get(gid, "") for gid in gids]
         genres_str = ", ".join([g for g in genres if g])
 
-        # IMDb-ссылка (как в старом билде)
-        imdb_id = None
-        try:
-            external = tmdb_get(f"/{media_type}/{tmdb_id}/external_ids", {})
-            if external:
-                imdb_id = external.get("imdb_id")
-        except Exception:
-            imdb_id = None
-
-        imdb_link = f"https://www.imdb.com/title/{imdb_id}" if imdb_id else None
+        imdb_link = get_imdb_link(media_type, tmdb_id)
 
         kind = "Сериал" if media_type == "tv" else "Фильм"
 
@@ -524,7 +545,6 @@ def send_calibration_batch(chat_id: int, user_id: int):
 
         caption = "\n".join(caption_lines)
 
-        # Клавиатура как раньше: смотрел / не смотрел / сердечко
         kb = types.InlineKeyboardMarkup()
         kb.row(
             types.InlineKeyboardButton("Смотрел", callback_data=f"calib:{row_id}:watched"),
@@ -535,7 +555,7 @@ def send_calibration_batch(chat_id: int, user_id: int):
         )
 
         if poster_path:
-            poster_url = f"https://image.tmdb.org/t/p/w500{poster_path}"
+            poster_url = f"{TMDB_IMAGE_BASE}{poster_path}"
             bot.send_photo(chat_id, poster_url, caption=caption, reply_markup=kb)
         else:
             bot.send_message(chat_id, caption, reply_markup=kb)
@@ -556,10 +576,8 @@ def build_recommendations(user_id: int, limit: int = 20) -> List[Dict[str, Any]]
 
     candidate_scores: Dict[int, Dict[str, Any]] = {}
 
-    # собираем кандидатов
     for tmdb_id, title, media_type in favorites:
         items = get_similar_and_recommended(media_type, tmdb_id) or []
-
         for it in items:
             cid = it["id"]
 
@@ -612,7 +630,7 @@ def build_recommendations(user_id: int, limit: int = 20) -> List[Dict[str, Any]]
         feedback_bonus = feedback_weights.get(cid, 0)
         year = data["year"] or 2000
 
-        current_year = 2025  # можно обновить потом
+        current_year = 2025  # можно обновить позже
         age = max(0, current_year - year)
 
         # приоритет по новизне
@@ -639,7 +657,7 @@ def build_recommendations(user_id: int, limit: int = 20) -> List[Dict[str, Any]]
 
     ranked = sorted(candidate_scores.values(), key=lambda x: x["score"], reverse=True)
 
-    # жёстко ограничим долю старых тайтлов
+    # ограничиваем долю старых тайтлов
     top_recent = []
     older = []
     for item in ranked:
@@ -661,10 +679,14 @@ def build_recommendations(user_id: int, limit: int = 20) -> List[Dict[str, Any]]
 def send_recommendation_card(chat_id: int, user_id: int, item: Dict[str, Any]):
     """
     Карточка с постером, рус/англ названиями, жанрами, рейтингом и ссылкой на IMDb.
+    + записываем status=shown, чтобы понижать приоритет тайтлов, на которые не кликнули.
     """
     tmdb_id = item["tmdb_id"]
     media_type = item["media_type"]
     title = item["title"]
+
+    # отмечаем, что рекомендация была показана
+    add_feedback(user_id, tmdb_id, "shown")
 
     details = get_tmdb_details(media_type, tmdb_id) or {}
     poster_path = details.get("poster_path")
@@ -686,7 +708,6 @@ def send_recommendation_card(chat_id: int, user_id: int, item: Dict[str, Any]):
     genres_str = ", ".join([g for g in genre_names if g])
 
     imdb_link = get_imdb_link(media_type, tmdb_id)
-
     kind = "Сериал" if media_type == "tv" else "Фильм"
 
     caption_lines = [f"<b>{title}</b>"]
@@ -703,13 +724,19 @@ def send_recommendation_card(chat_id: int, user_id: int, item: Dict[str, Any]):
     text = "\n".join(caption_lines)
 
     kb = types.InlineKeyboardMarkup()
+    # 1-я строка: любимые + watchlist
     kb.row(
         types.InlineKeyboardButton("❤️ В любимые", callback_data=f"recfav:{tmdb_id}:{media_type}"),
-        types.InlineKeyboardButton("👁 Уже смотрел", callback_data=f"recseen:{tmdb_id}:{media_type}"),
+        types.InlineKeyboardButton("📌 В watchlist", callback_data=f"recwl:{tmdb_id}:{media_type}"),
     )
+    # 2-я строка: уже смотрел + не предлагать
     kb.row(
-        types.InlineKeyboardButton("🔔 Следить за сериалом", callback_data=f"recsub:{tmdb_id}:{media_type}"),
+        types.InlineKeyboardButton("👁 Уже смотрел", callback_data=f"recseen:{tmdb_id}:{media_type}"),
         types.InlineKeyboardButton("👎 Не предлагать", callback_data=f"recban:{tmdb_id}:{media_type}"),
+    )
+    # 3-я строка: подписка на сериал
+    kb.row(
+        types.InlineKeyboardButton("🔔 Следить за сериалом", callback_data=f"recsub:{tmdb_id}:{media_type}")
     )
 
     if poster_path:
@@ -741,7 +768,6 @@ def subscription_worker():
                     continue
                 new_last_air_date = details.get("last_air_date") or details.get("first_air_date")
                 if new_last_air_date and new_last_air_date != last_air_date:
-                    # обновился last_air_date -> notify
                     update_subscription_last_air_date(user_id, tmdb_id, new_last_air_date)
                     chat_id = get_chat_id(user_id)
                     if chat_id:
@@ -784,6 +810,7 @@ def handle_start(message: types.Message):
             "Команды:\n"
             "• /recommend — подобрать, что посмотреть\n"
             "• /mylikes — показать твой список любимых\n"
+            "• /watchlist — твой плейлист «Буду смотреть»\n"
             "• /mysubs — сериалы, за которыми я слежу\n"
             "• /help — подсказка по функциям"
         )
@@ -795,10 +822,9 @@ def handle_help(message: types.Message):
     user_id = get_user_id(chat_id)
     touch_user_visit(user_id)
 
-    # быстрый доступ к командам
     kb = types.ReplyKeyboardMarkup(resize_keyboard=True)
     kb.row("/recommend", "/mylikes")
-    kb.row("/mysubs", "/help")
+    kb.row("/watchlist", "/mysubs")
 
     bot.send_message(
         chat_id,
@@ -810,6 +836,7 @@ def handle_help(message: types.Message):
         "4. Используй /recommend, чтобы получить подборку.\n\n"
         "Сервисные команды:\n"
         "• /mylikes — твой список любимых\n"
+        "• /watchlist — плейлист «Буду смотреть»\n"
         "• /mysubs — сериалы под слежением\n"
         "• /recommend — свежие рекомендации",
         reply_markup=kb
@@ -838,6 +865,34 @@ def handle_mylikes(message: types.Message):
         lines.append("")
     if tvs:
         lines.append("<b>Сериалы:</b>")
+        for tmdb_id, title, _ in tvs:
+            lines.append(f"• {title}")
+
+    bot.send_message(chat_id, "\n".join(lines))
+
+
+@bot.message_handler(commands=['watchlist'])
+def handle_watchlist(message: types.Message):
+    chat_id = message.chat.id
+    user_id = get_user_id(chat_id)
+    touch_user_visit(user_id)
+
+    wl = get_watchlist(user_id)
+    if not wl:
+        bot.send_message(chat_id, "Твой watchlist пуст. Добавляй сюда тайтлы из рекомендаций 📌")
+        return
+
+    movies = [w for w in wl if w[2] == "movie"]
+    tvs = [w for w in wl if w[2] == "tv"]
+
+    lines = []
+    if movies:
+        lines.append("<b>Фильмы в watchlist:</b>")
+        for tmdb_id, title, _ in movies:
+            lines.append(f"• {title}")
+        lines.append("")
+    if tvs:
+        lines.append("<b>Сериалы в watchlist:</b>")
         for tmdb_id, title, _ in tvs:
             lines.append(f"• {title}")
 
@@ -909,11 +964,10 @@ def handle_text(message: types.Message):
     elif state == "await_subscribe_title":
         handle_await_subscribe_title(message, user_id)
     else:
-        # фоллбек — подсказываем команды
         bot.send_message(
             chat_id,
             "Я тебя услышал, но пока лучше пользоваться командами:\n"
-            "/recommend, /mylikes, /mysubs, /help"
+            "/recommend, /mylikes, /watchlist, /mysubs, /help"
         )
 
 
@@ -944,7 +998,6 @@ def handle_await_favorites(message: types.Message, user_id: int):
         )
         return
 
-    # Переходим к выбору жанров
     bot.send_message(
         chat_id,
         f"Отлично, у тебя уже {total} любимых тайтлов.\n"
@@ -1026,13 +1079,11 @@ def handle_callback(call: types.CallbackQuery):
             add_feedback(user_id, tmdb_id, status)
             if status == "favorite":
                 add_favorite(user_id, tmdb_id, title, media_type)
-                # если сериал — сразу включаем слежение
                 if media_type == "tv":
                     details = get_tmdb_details("tv", tmdb_id) or {}
                     last_air_date = details.get("last_air_date") or details.get("first_air_date")
                     add_subscription_for_tv(user_id, tmdb_id, title, last_air_date)
 
-        # считаем, остались ли среди уже показанных (shown=1) неоценённые
         conn = get_conn()
         c = conn.cursor()
         c.execute("""
@@ -1044,7 +1095,6 @@ def handle_callback(call: types.CallbackQuery):
 
         bot.answer_callback_query(call.id, "Сохранил 👍")
 
-        # если всё, что показали, уже оценено — шлём следующую тройку
         if remaining == 0 and get_state(user_id) == "calibration":
             send_calibration_batch(chat_id, user_id)
 
@@ -1067,6 +1117,14 @@ def handle_callback(call: types.CallbackQuery):
         add_feedback(user_id, tmdb_id, "favorite")
         bot.answer_callback_query(call.id, "Добавил в любимые ❤️")
 
+    elif data.startswith("recwl:"):
+        _, tmdb_id_str, media_type = data.split(":", 2)
+        tmdb_id = int(tmdb_id_str)
+        details = get_tmdb_details(media_type, tmdb_id) or {}
+        title = details.get("title") or details.get("name") or "Без названия"
+        add_to_watchlist(user_id, tmdb_id, title, media_type)
+        bot.answer_callback_query(call.id, "Добавил в watchlist 📌")
+
     elif data.startswith("recban:"):
         _, tmdb_id_str, media_type = data.split(":", 2)
         tmdb_id = int(tmdb_id_str)
@@ -1086,18 +1144,17 @@ def handle_callback(call: types.CallbackQuery):
             bot.answer_callback_query(call.id, "Буду следить за новыми сезонами 🔔")
 
     elif data.startswith("recseen:"):
-        # UX: «Как тебе «…»?» после того, как пользователь отметил «Уже смотрел»
+        # «Уже смотрел» -> тайтл исключаем из реко (blocked),
+        # но просим оценку, чтобы использовать как референс вкуса.
         _, tmdb_id_str, media_type = data.split(":", 2)
         tmdb_id = int(tmdb_id_str)
 
         details = get_tmdb_details(media_type, tmdb_id) or {}
         title = details.get("title") or details.get("name") or "этот тайтл"
 
-        # фиксируем, что пользователь уже смотрел
-        add_feedback(user_id, tmdb_id, "watched")
+        add_feedback(user_id, tmdb_id, "blocked")  # гарантированно не показываем в будущем
         bot.answer_callback_query(call.id, "Учёл, что ты уже смотрел 👁")
 
-        # задаём уточняющий вопрос
         kb = types.InlineKeyboardMarkup()
         kb.row(
             types.InlineKeyboardButton("👍 Понравился", callback_data=f"recrate:{tmdb_id}:{media_type}:like"),
@@ -1106,7 +1163,6 @@ def handle_callback(call: types.CallbackQuery):
         bot.send_message(chat_id, f"Как тебе «{title}»?", reply_markup=kb)
 
     elif data.startswith("recrate:"):
-        # дооценка после «Уже смотрел»
         _, tmdb_id_str, media_type, verdict = data.split(":", 3)
         tmdb_id = int(tmdb_id_str)
         status = "liked" if verdict == "like" else "disliked"
@@ -1121,16 +1177,7 @@ def handle_callback(call: types.CallbackQuery):
     elif data == "more_recs":
         bot.answer_callback_query(call.id)
         # просто повторно вызываем /recommend для этого чата
-        fake_message = types.Message(
-            message_id=call.message.message_id,
-            date=call.message.date,
-            chat=call.message.chat,
-            content_type="text",
-            options={},
-            json_string=""
-        )
-        fake_message.text = "/recommend"
-        handle_recommend(fake_message)
+        handle_recommend(call.message)
 
     else:
         bot.answer_callback_query(call.id)
@@ -1142,7 +1189,6 @@ def handle_callback(call: types.CallbackQuery):
 
 if __name__ == "__main__":
     init_db()
-    # фоновый поток проверки подписок
     threading.Thread(target=subscription_worker, daemon=True).start()
     print("Bot is running...")
     bot.infinity_polling(skip_pending=True, timeout=20, long_polling_timeout=20)
